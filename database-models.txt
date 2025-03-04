@@ -1,0 +1,387 @@
+# app/database.py
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+from contextlib import contextmanager
+
+# Get database URL from environment or use default
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost/expense_tracker")
+
+# Create engine
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Base class for models
+Base = declarative_base()
+
+# Dependency for database session
+def get_db():
+    """Get database session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Context manager for database session
+@contextmanager
+def get_db_context():
+    """Context manager for database session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# app/models.py
+from sqlalchemy import Column, Integer, String, Float, Date, ForeignKey, UniqueConstraint, Text
+from sqlalchemy.orm import relationship
+from .database import Base
+from datetime import datetime
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    refresh_token = Column(String(500), nullable=False)
+    created_at = Column(Date, default=datetime.now().date())
+    
+    # Relationships
+    categories = relationship("Category", back_populates="user", cascade="all, delete-orphan")
+    expenses = relationship("Expense", back_populates="user", cascade="all, delete-orphan")
+
+class Category(Base):
+    __tablename__ = "categories"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="categories")
+    expenses = relationship("Expense", back_populates="category")
+    
+    # Constraints
+    __table_args__ = (
+        UniqueConstraint('name', 'user_id', name='_category_user_uc'),
+    )
+
+class Expense(Base):
+    __tablename__ = "expenses"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    merchant = Column(String(100), nullable=False, index=True)
+    description = Column(String(500))
+    category_id = Column(Integer, ForeignKey("categories.id"))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    email_id = Column(String(100), unique=True)  # Gmail message ID to avoid duplicates
+    created_at = Column(Date, default=datetime.now().date())
+    
+    # Relationships
+    category = relationship("Category", back_populates="expenses")
+    user = relationship("User", back_populates="expenses")
+
+
+# app/schemas.py
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from datetime import date, datetime
+
+# User schemas
+class UserBase(BaseModel):
+    email: str
+
+class UserCreate(UserBase):
+    refresh_token: str
+
+class GoogleAuthRequest(UserBase):
+    refresh_token: str
+
+class User(UserBase):
+    id: int
+    created_at: date
+    
+    class Config:
+        orm_mode = True
+
+class UserResponse(BaseModel):
+    success: bool
+    user_id: int
+
+# Category schemas
+class CategoryBase(BaseModel):
+    name: str
+
+class CategoryCreate(CategoryBase):
+    pass
+
+class CategoryUpdate(CategoryBase):
+    pass
+
+class Category(CategoryBase):
+    id: int
+    user_id: int
+    
+    class Config:
+        orm_mode = True
+
+# Expense schemas
+class ExpenseBase(BaseModel):
+    date: date
+    amount: float
+    merchant: str
+    description: Optional[str] = None
+    category_id: Optional[int] = None
+
+class ExpenseCreate(ExpenseBase):
+    user_id: int
+    email_id: Optional[str] = None
+
+class ExpenseUpdate(BaseModel):
+    date: Optional[date] = None
+    amount: Optional[float] = None
+    merchant: Optional[str] = None
+    description: Optional[str] = None
+    category_id: Optional[int] = None
+
+class Expense(ExpenseBase):
+    id: int
+    user_id: int
+    category: Optional[Category] = None
+    created_at: date
+    
+    class Config:
+        orm_mode = True
+
+# Dashboard schemas
+class DashboardSummary(BaseModel):
+    total_spending: float
+    spending_by_category: Dict[str, float]
+    top_merchants: Dict[str, float]
+
+# AI schemas
+class PredictionDay(BaseModel):
+    date: str
+    amount: float
+    lower_bound: Optional[float] = None
+    upper_bound: Optional[float] = None
+
+class ExpensePrediction(BaseModel):
+    predictions: List[PredictionDay]
+    model_info: Dict[str, Any]
+
+class BudgetCategoryRecommendation(BaseModel):
+    category: str
+    current_percentage: float
+    recommended_percentage: float
+    recommended_budget: float
+    reason: str
+
+class BudgetRecommendation(BaseModel):
+    predicted_monthly_expense: float
+    recommendations: List[BudgetCategoryRecommendation]
+
+# Task schemas
+class TaskResponse(BaseModel):
+    success: bool
+    message: str
+
+# General response schemas
+class DeleteResponse(BaseModel):
+    success: bool
+
+
+# app/crud.py
+from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
+from datetime import datetime
+from typing import Optional, List
+
+from . import models, schemas
+
+# User CRUD operations
+def get_user(db: Session, user_id: int):
+    """Get user by ID"""
+    return db.query(models.User).filter(models.User.id == user_id).first()
+
+def get_user_by_email(db: Session, email: str):
+    """Get user by email"""
+    return db.query(models.User).filter(models.User.email == email).first()
+
+def get_users(db: Session, skip: int = 0, limit: int = 100):
+    """Get all users with pagination"""
+    return db.query(models.User).offset(skip).limit(limit).all()
+
+def create_user(db: Session, user: schemas.GoogleAuthRequest):
+    """Create a new user"""
+    db_user = models.User(email=user.email, refresh_token=user.refresh_token)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+def update_user_token(db: Session, user_id: int, refresh_token: str):
+    """Update user's refresh token"""
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    db_user.refresh_token = refresh_token
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# Category CRUD operations
+def get_category(db: Session, category_id: int):
+    """Get category by ID"""
+    return db.query(models.Category).filter(models.Category.id == category_id).first()
+
+def get_category_by_name(db: Session, name: str, user_id: int):
+    """Get category by name for a specific user"""
+    return db.query(models.Category).filter(
+        models.Category.name.ilike(name),
+        models.Category.user_id == user_id
+    ).first()
+
+def get_categories(db: Session, user_id: int):
+    """Get all categories for a user"""
+    return db.query(models.Category).filter(models.Category.user_id == user_id).all()
+
+def create_category(db: Session, category: schemas.CategoryCreate, user_id: int):
+    """Create a new category"""
+    db_category = models.Category(name=category.name, user_id=user_id)
+    db.add(db_category)
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+def update_category(db: Session, category_id: int, category: schemas.CategoryUpdate):
+    """Update a category"""
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    db_category.name = category.name
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+def delete_category(db: Session, category_id: int):
+    """Delete a category"""
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    db.delete(db_category)
+    db.commit()
+    return True
+
+def get_or_create_uncategorized(db: Session, user_id: int):
+    """Get or create 'Uncategorized' category"""
+    uncategorized = db.query(models.Category).filter(
+        models.Category.name == "Uncategorized",
+        models.Category.user_id == user_id
+    ).first()
+    
+    if not uncategorized:
+        uncategorized = models.Category(name="Uncategorized", user_id=user_id)
+        db.add(uncategorized)
+        db.commit()
+        db.refresh(uncategorized)
+    
+    return uncategorized
+
+def reassign_category_expenses(db: Session, old_category_id: int, new_category_id: int):
+    """Reassign expenses from one category to another"""
+    db.query(models.Expense).filter(
+        models.Expense.category_id == old_category_id
+    ).update({"category_id": new_category_id})
+    db.commit()
+    return True
+
+# Expense CRUD operations
+def get_expense(db: Session, expense_id: int):
+    """Get expense by ID"""
+    return db.query(models.Expense).filter(models.Expense.id == expense_id).first()
+
+def get_expenses(
+    db: Session, 
+    user_id: int, 
+    category_id: Optional[int] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    search: Optional[str] = None,
+    limit: Optional[int] = None
+):
+    """Get expenses with various filters"""
+    query = db.query(models.Expense).filter(models.Expense.user_id == user_id)
+    
+    if category_id:
+        query = query.filter(models.Expense.category_id == category_id)
+    
+    if start_date:
+        query = query.filter(models.Expense.date >= start_date)
+    
+    if end_date:
+        query = query.filter(models.Expense.date <= end_date)
+    
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(or_(
+            models.Expense.merchant.ilike(search_term),
+            models.Expense.description.ilike(search_term)
+        ))
+    
+    query = query.order_by(models.Expense.date.desc())
+    
+    if limit:
+        query = query.limit(limit)
+    
+    return query.all()
+
+def get_all_expenses(db: Session, limit: Optional[int] = None):
+    """Get all expenses (admin function)"""
+    query = db.query(models.Expense)
+    
+    if limit:
+        query = query.limit(limit)
+    
+    return query.all()
+
+def create_expense(db: Session, expense: schemas.ExpenseCreate):
+    """Create a new expense"""
+    db_expense = models.Expense(
+        date=expense.date,
+        amount=expense.amount,
+        merchant=expense.merchant,
+        description=expense.description,
+        category_id=expense.category_id,
+        user_id=expense.user_id,
+        email_id=expense.email_id
+    )
+    db.add(db_expense)
+    db.commit()
+    db.refresh(db_expense)
+    return db_expense
+
+def update_expense(db: Session, expense_id: int, expense: schemas.ExpenseUpdate):
+    """Update an expense"""
+    db_expense = db.query(models.Expense).filter(models.Expense.id == expense_id).first()
+    
+    if expense.date is not None:
+        db_expense.date = expense.date
+    if expense.amount is not None:
+        db_expense.amount = expense.amount
+    if expense.merchant is not None:
+        db_expense.merchant = expense.merchant
+    if expense.description is not None:
+        db_expense.description = expense.description
+    # Allow setting category to None
+    db_expense.category_id = expense.category_id
+    
+    db.commit()
+    db.refresh(db_expense)
+    return db_expense
+
+def delete_expense(db: Session, expense_id: int):
+    """Delete an expense"""
+    db_expense = db.query(models.Expense).filter(models.Expense.id == expense_id).first()
+    db.delete(db_expense)
+    db.commit()
+    return True

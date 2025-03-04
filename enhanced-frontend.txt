@@ -1,0 +1,544 @@
+// src/api/apiClient.js
+import axios from 'axios';
+
+// Create axios instance with default config
+const apiClient = axios.create({
+  baseURL: '/api',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Add request interceptor for auth
+apiClient.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// Add response interceptor for error handling
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    // Handle 401 (Unauthorized) - redirect to login
+    if (error.response && error.response.status === 401) {
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      window.location.href = '/';
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default apiClient;
+
+// src/api/queries.js
+import { useQuery, useMutation, useQueryClient } from 'react-query';
+import apiClient from './apiClient';
+
+// User queries
+export const useCurrentUser = () => {
+  return useQuery('currentUser', () => {
+    const userData = localStorage.getItem('user');
+    return userData ? JSON.parse(userData) : null;
+  });
+};
+
+// Category queries
+export const useCategories = (userId) => {
+  return useQuery(
+    ['categories', userId],
+    () => apiClient.get(`/categories?user_id=${userId}`).then((res) => res.data),
+    {
+      enabled: !!userId,
+    }
+  );
+};
+
+export const useCreateCategory = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    (categoryData) => apiClient.post('/categories', categoryData),
+    {
+      onSuccess: (_, variables) => {
+        queryClient.invalidateQueries(['categories', variables.user_id]);
+      },
+    }
+  );
+};
+
+export const useUpdateCategory = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    ({ categoryId, data }) => apiClient.put(`/categories/${categoryId}`, data),
+    {
+      onSuccess: (_, variables) => {
+        const userId = queryClient.getQueryData('currentUser')?.id;
+        if (userId) {
+          queryClient.invalidateQueries(['categories', userId]);
+        }
+      },
+    }
+  );
+};
+
+export const useDeleteCategory = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    (categoryId) => apiClient.delete(`/categories/${categoryId}`),
+    {
+      onSuccess: () => {
+        const userId = queryClient.getQueryData('currentUser')?.id;
+        if (userId) {
+          queryClient.invalidateQueries(['categories', userId]);
+          queryClient.invalidateQueries(['expenses', userId]);
+        }
+      },
+    }
+  );
+};
+
+// Expense queries
+export const useExpenses = (userId, filters = {}) => {
+  const { categoryId, startDate, endDate, search } = filters;
+  
+  let queryString = `user_id=${userId}`;
+  if (categoryId) queryString += `&category_id=${categoryId}`;
+  if (startDate) queryString += `&start_date=${startDate}`;
+  if (endDate) queryString += `&end_date=${endDate}`;
+  if (search) queryString += `&search=${encodeURIComponent(search)}`;
+  
+  return useQuery(
+    ['expenses', userId, filters],
+    () => apiClient.get(`/expenses?${queryString}`).then((res) => res.data),
+    {
+      enabled: !!userId,
+    }
+  );
+};
+
+export const useCreateExpense = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    (expenseData) => apiClient.post('/expenses', expenseData),
+    {
+      onSuccess: (_, variables) => {
+        queryClient.invalidateQueries(['expenses', variables.user_id]);
+        queryClient.invalidateQueries(['dashboard', variables.user_id]);
+      },
+    }
+  );
+};
+
+export const useUpdateExpense = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    ({ expenseId, data }) => apiClient.put(`/expenses/${expenseId}`, data),
+    {
+      onSuccess: () => {
+        const userId = queryClient.getQueryData('currentUser')?.id;
+        if (userId) {
+          queryClient.invalidateQueries(['expenses', userId]);
+          queryClient.invalidateQueries(['dashboard', userId]);
+        }
+      },
+    }
+  );
+};
+
+export const useDeleteExpense = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    (expenseId) => apiClient.delete(`/expenses/${expenseId}`),
+    {
+      onSuccess: () => {
+        const userId = queryClient.getQueryData('currentUser')?.id;
+        if (userId) {
+          queryClient.invalidateQueries(['expenses', userId]);
+          queryClient.invalidateQueries(['dashboard', userId]);
+        }
+      },
+    }
+  );
+};
+
+// Dashboard queries
+export const useDashboardSummary = (userId) => {
+  return useQuery(
+    ['dashboard', userId],
+    () => apiClient.get(`/dashboard/summary?user_id=${userId}`).then((res) => res.data),
+    {
+      enabled: !!userId,
+    }
+  );
+};
+
+// AI feature queries
+export const useExpensePredictions = (userId, periods = 30) => {
+  return useQuery(
+    ['predictions', userId, periods],
+    () => apiClient.get(`/predictions/future-expenses?user_id=${userId}&periods=${periods}`)
+      .then((res) => res.data),
+    {
+      enabled: !!userId,
+      // Cache for longer since predictions don't change often
+      staleTime: 1000 * 60 * 60, // 1 hour
+    }
+  );
+};
+
+export const useBudgetRecommendations = (userId) => {
+  return useQuery(
+    ['budget-recommendations', userId],
+    () => apiClient.get(`/recommendations/budget?user_id=${userId}`).then((res) => res.data),
+    {
+      enabled: !!userId,
+      // Cache for longer since recommendations don't change often
+      staleTime: 1000 * 60 * 60, // 1 hour
+    }
+  );
+};
+
+export const useFetchEmails = () => {
+  const queryClient = useQueryClient();
+  return useMutation(
+    (userId) => apiClient.post(`/emails/fetch?user_id=${userId}`),
+    {
+      onSuccess: (_, variables) => {
+        // We'll wait a bit before invalidating since email fetching happens asynchronously
+        setTimeout(() => {
+          queryClient.invalidateQueries(['expenses', variables]);
+          queryClient.invalidateQueries(['dashboard', variables]);
+        }, 5000); // Wait 5 seconds before refreshing
+      },
+    }
+  );
+};
+
+// src/components/Dashboard/EnhancedDashboard.js
+import React, { useState } from 'react';
+import { makeStyles } from '@material-ui/core/styles';
+import {
+  Container,
+  Grid,
+  Paper,
+  Typography,
+  CircularProgress,
+  Button,
+  Tabs,
+  Tab,
+  Box,
+  Divider,
+} from '@material-ui/core';
+import RefreshIcon from '@material-ui/icons/Refresh';
+import AutorenewIcon from '@material-ui/icons/Autorenew';
+import AssessmentIcon from '@material-ui/icons/Assessment';
+import TimelineIcon from '@material-ui/icons/Timeline';
+import AccountBalanceWalletIcon from '@material-ui/icons/AccountBalanceWallet';
+import { useCurrentUser, useDashboardSummary, useFetchEmails, useExpensePredictions, useBudgetRecommendations } from '../../api/queries';
+import SpendingByCategory from './SpendingByCategory';
+import SpendingTrend from './SpendingTrend';
+import TopMerchants from './TopMerchants';
+import RecentExpenses from './RecentExpenses';
+import FuturePredictions from './FuturePredictions';
+import BudgetRecommendations from './BudgetRecommendations';
+import { ErrorBoundary } from 'react-error-boundary';
+import { useSnackbar } from '../../contexts/SnackbarContext';
+
+const useStyles = makeStyles((theme) => ({
+  container: {
+    paddingTop: theme.spacing(4),
+    paddingBottom: theme.spacing(4),
+  },
+  paper: {
+    padding: theme.spacing(3),
+    display: 'flex',
+    flexDirection: 'column',
+    height: '100%',
+  },
+  title: {
+    marginBottom: theme.spacing(2),
+  },
+  totalAmount: {
+    fontSize: '2.5rem',
+    fontWeight: 500,
+    marginBottom: theme.spacing(1),
+  },
+  amountLabel: {
+    color: theme.palette.text.secondary,
+  },
+  tabContent: {
+    marginTop: theme.spacing(2),
+  },
+  refreshButton: {
+    marginRight: theme.spacing(1),
+  },
+  actionButtons: {
+    marginTop: theme.spacing(2),
+  },
+  fullHeight: {
+    height: '100%',
+  },
+  loadingContainer: {
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    height: 200,
+  },
+  errorContainer: {
+    padding: theme.spacing(2),
+    color: theme.palette.error.main,
+    textAlign: 'center',
+  },
+}));
+
+// Error fallback component
+const ErrorFallback = ({ error, resetErrorBoundary }) => {
+  const classes = useStyles();
+  return (
+    <div className={classes.errorContainer}>
+      <Typography variant="h6" gutterBottom>Something went wrong:</Typography>
+      <Typography variant="body2" paragraph>{error.message}</Typography>
+      <Button variant="outlined" color="primary" onClick={resetErrorBoundary}>
+        Try again
+      </Button>
+    </div>
+  );
+};
+
+function EnhancedDashboard() {
+  const classes = useStyles();
+  const { showSnackbar } = useSnackbar();
+  const [activeTab, setActiveTab] = useState(0);
+  
+  // Get current user
+  const { data: currentUser } = useCurrentUser();
+  
+  // Dashboard data
+  const { 
+    data: dashboardData, 
+    isLoading: isDashboardLoading, 
+    error: dashboardError,
+    refetch: refetchDashboard 
+  } = useDashboardSummary(currentUser?.id);
+  
+  // Email fetching
+  const { mutate: fetchEmails, isLoading: isFetchingEmails } = useFetchEmails();
+  
+  // Future predictions
+  const { 
+    data: predictionsData, 
+    isLoading: isPredictionsLoading 
+  } = useExpensePredictions(currentUser?.id);
+  
+  // Budget recommendations
+  const { 
+    data: recommendationsData, 
+    isLoading: isRecommendationsLoading 
+  } = useBudgetRecommendations(currentUser?.id);
+  
+  // Handle tab change
+  const handleTabChange = (event, newValue) => {
+    setActiveTab(newValue);
+  };
+  
+  // Handle fetch emails
+  const handleFetchEmails = () => {
+    if (currentUser?.id) {
+      fetchEmails(currentUser.id);
+      showSnackbar('Fetching emails in the background. Check back soon for new expenses.', 'info');
+    }
+  };
+  
+  // Handle dashboard refresh
+  const handleRefreshDashboard = () => {
+    refetchDashboard();
+    showSnackbar('Dashboard refreshed', 'success');
+  };
+  
+  return (
+    <Container maxWidth="lg" className={classes.container}>
+      <Grid container spacing={3}>
+        {/* Top row with summary and tabs */}
+        <Grid item xs={12} md={4}>
+          <Paper className={classes.paper}>
+            <Typography variant="h6" className={classes.title}>
+              Current Month Spending
+            </Typography>
+            {isDashboardLoading ? (
+              <div className={classes.loadingContainer}>
+                <CircularProgress />
+              </div>
+            ) : dashboardError ? (
+              <div className={classes.errorContainer}>
+                <Typography variant="body1" color="error">
+                  Error loading dashboard data
+                </Typography>
+                <Button 
+                  variant="outlined" 
+                  color="primary" 
+                  onClick={handleRefreshDashboard}
+                  className={classes.actionButtons}
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : (
+              <>
+                <Typography variant="h3" className={classes.totalAmount}>
+                  ${dashboardData?.total_spending.toFixed(2) || '0.00'}
+                </Typography>
+                <Typography variant="body2" className={classes.amountLabel}>
+                  Total expenses this month
+                </Typography>
+                <div className={classes.actionButtons}>
+                  <Button
+                    variant="outlined"
+                    color="primary"
+                    startIcon={<RefreshIcon />}
+                    onClick={handleRefreshDashboard}
+                    className={classes.refreshButton}
+                  >
+                    Refresh
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    color="secondary"
+                    startIcon={<AutorenewIcon />}
+                    onClick={handleFetchEmails}
+                    disabled={isFetchingEmails}
+                  >
+                    {isFetchingEmails ? 'Fetching...' : 'Fetch Emails'}
+                  </Button>
+                </div>
+              </>
+            )}
+          </Paper>
+        </Grid>
+        
+        <Grid item xs={12} md={8}>
+          <Paper className={classes.paper}>
+            <Tabs
+              value={activeTab}
+              onChange={handleTabChange}
+              indicatorColor="primary"
+              textColor="primary"
+              variant="fullWidth"
+            >
+              <Tab icon={<AssessmentIcon />} label="Overview" />
+              <Tab icon={<TimelineIcon />} label="Predictions" />
+              <Tab icon={<AccountBalanceWalletIcon />} label="Budgeting" />
+            </Tabs>
+          </Paper>
+        </Grid>
+        
+        {/* Content based on active tab */}
+        {activeTab === 0 && (
+          <>
+            {/* Overview Tab */}
+            <Grid item xs={12} md={8}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    Recent Expenses
+                  </Typography>
+                  <RecentExpenses 
+                    userId={currentUser?.id}
+                    isLoading={isDashboardLoading} 
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+          </>
+        )}
+        
+        {activeTab === 1 && (
+          <>
+            {/* Predictions Tab */}
+            <Grid item xs={12}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    Future Expense Predictions
+                  </Typography>
+                  <FuturePredictions 
+                    data={predictionsData} 
+                    isLoading={isPredictionsLoading} 
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+          </>
+        )}
+        
+        {activeTab === 2 && (
+          <>
+            {/* Budgeting Tab */}
+            <Grid item xs={12}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    AI Budget Recommendations
+                  </Typography>
+                  <BudgetRecommendations 
+                    data={recommendationsData} 
+                    isLoading={isRecommendationsLoading} 
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+          </>
+        )}
+      </Grid>
+    </Container>
+  );
+}
+
+export default EnhancedDashboard;={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    Spending by Category
+                  </Typography>
+                  <SpendingByCategory 
+                    data={dashboardData?.spending_by_category} 
+                    isLoading={isDashboardLoading}
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+            
+            <Grid item xs={12}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    Monthly Spending Trend
+                  </Typography>
+                  <SpendingTrend 
+                    userId={currentUser?.id}
+                    isLoading={isDashboardLoading} 
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+            
+            <Grid item xs={12} md={6}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className={classes.paper}>
+                  <Typography variant="h6" className={classes.title}>
+                    Top Merchants
+                  </Typography>
+                  <TopMerchants 
+                    data={dashboardData?.top_merchants} 
+                    isLoading={isDashboardLoading} 
+                  />
+                </Paper>
+              </ErrorBoundary>
+            </Grid>
+            
+            <Grid item xs={12} md={6}>
+              <ErrorBoundary FallbackComponent={ErrorFallback}>
+                <Paper className

@@ -1,0 +1,165 @@
+# Dockerfile
+FROM python:3.9-slim as backend
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend code
+COPY *.py .
+COPY migrations ./migrations
+
+# Stage 2: Frontend build
+FROM node:16 as frontend-build
+
+WORKDIR /app
+
+# Copy package.json and install dependencies
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+# Copy frontend code and build
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 3: Final image
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Copy backend from first stage
+COPY --from=backend /app /app
+COPY --from=backend /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+
+# Copy frontend build
+COPY --from=frontend-build /app/build /app/static
+
+# Set environment variables
+ENV FLASK_APP=app.py
+ENV FLASK_ENV=production
+
+# Expose port
+EXPOSE 5000
+
+# Run migrations and start app
+CMD flask db upgrade && gunicorn -b 0.0.0.0:5000 app:app
+
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=expense_tracker
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:6
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+
+  celery:
+    build: .
+    command: celery -A app.celery worker --loglevel=info
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+
+  celery-beat:
+    build: .
+    command: celery -A app.celery beat --loglevel=info
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+
+volumes:
+  postgres_data:
+
+
+# .github/workflows/deploy.yml
+name: Deploy Expense Tracker
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      
+      - name: Login to Heroku Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: registry.heroku.com
+          username: ${{ secrets.HEROKU_EMAIL }}
+          password: ${{ secrets.HEROKU_API_KEY }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: registry.heroku.com/${{ secrets.HEROKU_APP_NAME }}/web
+      
+      - name: Release to Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          heroku container:release web --app ${{ secrets.HEROKU_APP_NAME }}
+
+
+# requirements.txt
+flask==2.0.1
+flask-cors==3.0.10
+flask-sqlalchemy==2.5.1
+flask-migrate==3.1.0
+psycopg2-binary==2.9.1
+celery==5.1.2
+redis==3.5.3
+google-api-python-client==2.15.0
+google-auth-oauthlib==0.4.5
+python-dotenv==0.19.0
+beautifulsoup4==4.9.3
+gunicorn==20.1.0
+python-dateutil==2.8.2
+cryptography==3.4.8

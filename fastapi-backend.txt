@@ -1,0 +1,465 @@
+# app/main.py
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+import os
+
+from .database import get_db, engine
+from . import models, schemas, crud
+from .auth import get_current_user
+from .ai.nlp_processor import ExpenseNLPProcessor
+from .ai.expense_predictor import ExpensePredictor
+from .ai.budget_recommender import BudgetRecommender
+from .ai.email_parser_ml import MLEmailParser
+from .task_scheduler import schedule_email_fetch, fetch_emails
+
+# Create tables
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Expense Tracker API", version="2.0.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development; restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize AI models
+nlp_processor = ExpenseNLPProcessor()
+expense_predictor = ExpensePredictor()
+budget_recommender = BudgetRecommender()
+email_parser = MLEmailParser()
+
+# Authentication routes
+@app.post("/api/auth/google", response_model=schemas.UserResponse)
+def google_auth(auth_data: schemas.GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Authenticate user with Google OAuth"""
+    if not auth_data.email or not auth_data.refresh_token:
+        raise HTTPException(status_code=400, detail="Missing email or refresh token")
+    
+    user = crud.get_user_by_email(db, email=auth_data.email)
+    
+    if user:
+        # Update refresh token
+        user = crud.update_user_token(db, user.id, auth_data.refresh_token)
+    else:
+        # Create new user
+        user = crud.create_user(db, auth_data)
+        
+        # Create default categories for new user
+        default_categories = ['Food', 'Shopping', 'Transportation', 'Entertainment', 'Bills', 'Other']
+        for cat_name in default_categories:
+            crud.create_category(db, schemas.CategoryCreate(name=cat_name), user.id)
+    
+    return {"success": True, "user_id": user.id}
+
+# Category routes
+@app.get("/api/categories", response_model=List[schemas.Category])
+def get_categories(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get all categories for a user"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    categories = crud.get_categories(db, user_id)
+    return categories
+
+@app.post("/api/categories", response_model=schemas.Category)
+def create_category(
+    category: schemas.CategoryCreate,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Create a new category"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    return crud.create_category(db, category, user_id)
+
+@app.put("/api/categories/{category_id}", response_model=schemas.Category)
+def update_category(
+    category_id: int,
+    category: schemas.CategoryUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Update a category"""
+    db_category = crud.get_category(db, category_id)
+    if not db_category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    if db_category.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this category")
+    
+    return crud.update_category(db, category_id, category)
+
+@app.delete("/api/categories/{category_id}", response_model=schemas.DeleteResponse)
+def delete_category(
+    category_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Delete a category"""
+    db_category = crud.get_category(db, category_id)
+    if not db_category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    if db_category.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this category")
+    
+    # Get or create "Uncategorized" category
+    uncategorized = crud.get_or_create_uncategorized(db, current_user.id)
+    
+    # Reassign expenses
+    crud.reassign_category_expenses(db, category_id, uncategorized.id)
+    
+    # Delete category
+    crud.delete_category(db, category_id)
+    
+    return {"success": True}
+
+# Expense routes
+@app.get("/api/expenses", response_model=List[schemas.Expense])
+def get_expenses(
+    user_id: int,
+    category_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(None, gt=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get expenses for a user with optional filters"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    # Parse dates if provided
+    start_date_obj = None
+    end_date_obj = None
+    
+    if start_date:
+        try:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+    
+    if end_date:
+        try:
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+    
+    expenses = crud.get_expenses(
+        db, 
+        user_id, 
+        category_id=category_id, 
+        start_date=start_date_obj, 
+        end_date=end_date_obj,
+        search=search,
+        limit=limit
+    )
+    
+    return expenses
+
+@app.post("/api/expenses", response_model=schemas.Expense)
+def create_expense(
+    expense: schemas.ExpenseCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Create a new expense"""
+    if expense.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to create expense for this user")
+    
+    # Use NLP to suggest category if none provided
+    if not expense.category_id:
+        # Create a temporary DB model to pass to NLP processor
+        temp_expense = models.Expense(
+            merchant=expense.merchant,
+            description=expense.description,
+            amount=expense.amount,
+            date=expense.date
+        )
+        
+        # Get category suggestion
+        category_name = nlp_processor.predict_category(temp_expense)
+        
+        # Find category ID by name
+        if category_name:
+            category = crud.get_category_by_name(db, category_name, current_user.id)
+            if category:
+                expense.category_id = category.id
+    
+    return crud.create_expense(db, expense)
+
+@app.put("/api/expenses/{expense_id}", response_model=schemas.Expense)
+def update_expense(
+    expense_id: int,
+    expense: schemas.ExpenseUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Update an expense"""
+    db_expense = crud.get_expense(db, expense_id)
+    if not db_expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    
+    if db_expense.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this expense")
+    
+    return crud.update_expense(db, expense_id, expense)
+
+@app.delete("/api/expenses/{expense_id}", response_model=schemas.DeleteResponse)
+def delete_expense(
+    expense_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Delete an expense"""
+    db_expense = crud.get_expense(db, expense_id)
+    if not db_expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    
+    if db_expense.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this expense")
+    
+    crud.delete_expense(db, expense_id)
+    
+    return {"success": True}
+
+# Dashboard routes
+@app.get("/api/dashboard/summary", response_model=schemas.DashboardSummary)
+def get_dashboard_summary(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get dashboard summary data"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    # Get current month expenses
+    current_month = datetime.now().replace(day=1)
+    expenses = crud.get_expenses(
+        db, 
+        user_id, 
+        start_date=current_month
+    )
+    
+    # Calculate total spending
+    total_spending = sum(expense.amount for expense in expenses)
+    
+    # Spending by category
+    spending_by_category = {}
+    for expense in expenses:
+        category_name = expense.category.name if expense.category else 'Uncategorized'
+        if category_name in spending_by_category:
+            spending_by_category[category_name] += expense.amount
+        else:
+            spending_by_category[category_name] = expense.amount
+    
+    # Top merchants
+    merchant_spending = {}
+    for expense in expenses:
+        if expense.merchant in merchant_spending:
+            merchant_spending[expense.merchant] += expense.amount
+        else:
+            merchant_spending[expense.merchant] = expense.amount
+    
+    top_merchants_list = sorted(merchant_spending.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_merchants = {merchant: amount for merchant, amount in top_merchants_list}
+    
+    return {
+        "total_spending": total_spending,
+        "spending_by_category": spending_by_category,
+        "top_merchants": top_merchants
+    }
+
+# AI-Enhanced routes
+@app.get("/api/predictions/future-expenses", response_model=schemas.ExpensePrediction)
+def predict_future_expenses(
+    user_id: int,
+    periods: int = 30,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Predict future expenses using the Prophet model"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    # Get all user expenses for training
+    all_expenses = crud.get_expenses(db, user_id)
+    
+    # Train model if not already trained
+    if not expense_predictor.model:
+        success = expense_predictor.train_model(all_expenses)
+        if not success:
+            raise HTTPException(status_code=400, detail="Not enough expense data to make predictions")
+    
+    # Make predictions
+    predictions = expense_predictor.predict_future_expenses(periods=periods)
+    if not predictions:
+        raise HTTPException(status_code=400, detail="Failed to generate predictions")
+    
+    return {
+        "predictions": predictions,
+        "model_info": {
+            "trained_on": len(all_expenses),
+            "periods": periods
+        }
+    }
+
+@app.get("/api/recommendations/budget", response_model=schemas.BudgetRecommendation)
+def get_budget_recommendations(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get AI-driven budget recommendations"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    # Collect data for all users for clustering
+    all_user_expenses = {}
+    users = crud.get_users(db, limit=100)  # Limit to avoid performance issues
+    
+    for user in users:
+        user_expenses = crud.get_expenses(db, user.id)
+        all_user_expenses[user.id] = user_expenses
+    
+    # Cluster users
+    user_clusters = budget_recommender.cluster_users_by_spending(all_user_expenses)
+    
+    # Generate recommendations
+    recommendations = budget_recommender.recommend_budget(user_id, user_clusters)
+    
+    if not recommendations:
+        raise HTTPException(status_code=400, detail="Not enough data to generate recommendations")
+    
+    return recommendations
+
+@app.post("/api/emails/fetch", response_model=schemas.TaskResponse)
+def fetch_user_emails(
+    user_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Fetch emails for a user"""
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user's data")
+    
+    # Schedule email fetching task
+    background_tasks.add_task(fetch_emails, user_id)
+    
+    return {"success": True, "message": "Email fetching task scheduled"}
+
+# WebSocket for real-time updates
+from fastapi import WebSocket, WebSocketDisconnect
+from .websocket import ConnectionManager
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
+    """WebSocket connection for real-time updates"""
+    await manager.connect(websocket, user_id)
+    try:
+        # Authentication would go here in a production environment
+        
+        while True:
+            # Wait for messages, but we're primarily using this for server->client communication
+            data = await websocket.receive_text()
+            # Process any client messages if needed
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, user_id)
+
+# Provide global notification when new expenses are added
+def notify_new_expense(user_id: int, expense: schemas.Expense):
+    """Notify connected clients about new expense"""
+    manager.broadcast_to_user(
+        user_id,
+        {
+            "type": "new_expense",
+            "data": expense.dict()
+        }
+    )
+
+# Scheduled tasks
+@app.on_event("startup")
+def startup_event():
+    """Set up scheduled tasks on startup"""
+    import asyncio
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    
+    scheduler = AsyncIOScheduler()
+    
+    # Schedule daily email fetching
+    scheduler.add_job(
+        schedule_email_fetch,
+        CronTrigger(hour=1, minute=0),  # Run at 1:00 AM every day
+        args=[get_db]
+    )
+    
+    # Schedule model retraining
+    scheduler.add_job(
+        retrain_models,
+        CronTrigger(day_of_week="sun", hour=3, minute=0),  # Run at 3:00 AM every Sunday
+        args=[get_db]
+    )
+    
+    scheduler.start()
+
+async def retrain_models(db_getter):
+    """Retrain all ML models with latest data"""
+    db = next(db_getter())
+    try:
+        # Retrain NLP model
+        all_expenses = crud.get_all_expenses(db, limit=10000)  # Limit to avoid memory issues
+        nlp_processor.train_model(all_expenses)
+        
+        # Retrain Prophet models for each user
+        users = crud.get_users(db)
+        for user in users:
+            user_expenses = crud.get_expenses(db, user.id)
+            if len(user_expenses) >= 30:  # Need reasonable amount of data
+                predictor = ExpensePredictor()
+                predictor.train_model(user_expenses)
+    finally:
+        db.close()
+
+# Health check endpoint
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+# API documentation customization
+app.title = "Expense Tracker API"
+app.description = """
+Expense Tracker API with advanced AI features for expense categorization,
+prediction, and budget recommendations.
+
+## Features
+
+* Google OAuth authentication
+* Expense management
+* Category management 
+* Email parsing using ML
+* Expense prediction using Prophet
+* Budget recommendations
+* Real-time updates via WebSockets
+"""
+app.version = "2.0.0"

@@ -1,0 +1,473 @@
+// src/components/CategoryManager.js
+import React, { useState, useEffect } from 'react';
+import { makeStyles } from '@material-ui/core/styles';
+import {
+  Container,
+  Paper,
+  Typography,
+  List,
+  ListItem,
+  ListItemText,
+  ListItemSecondaryAction,
+  IconButton,
+  Button,
+  TextField,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Divider,
+  Grid,
+  CircularProgress,
+  Chip,
+} from '@material-ui/core';
+import {
+  Add as AddIcon,
+  Edit as EditIcon,
+  Delete as DeleteIcon,
+  Label as LabelIcon,
+} from '@material-ui/icons';
+import axios from 'axios';
+import { useAuth } from '../contexts/AuthContext';
+import { useSnackbar } from '../contexts/SnackbarContext';
+
+// Helper to map AI-suggested categories based on expense patterns
+const suggestCategoryHelper = (expenses) => {
+  const currentMonth = new Date().getMonth();
+  const suggestions = [];
+  
+  // Check if we have holiday/gift related expenses in Nov-Dec
+  if (currentMonth >= 10) { // November or December
+    const giftKeywords = ['gift', 'present', 'christmas', 'holiday', 'card'];
+    const hasHolidayExpenses = expenses.some(exp => 
+      giftKeywords.some(keyword => 
+        exp.merchant.toLowerCase().includes(keyword) || 
+        (exp.description && exp.description.toLowerCase().includes(keyword))
+      )
+    );
+    
+    if (hasHolidayExpenses) {
+      suggestions.push('Holiday Gifts');
+    }
+  }
+  
+  // Check for travel expenses
+  const travelKeywords = ['hotel', 'flight', 'airline', 'airbnb', 'booking', 'vacation'];
+  const hasTravelExpenses = expenses.some(exp => 
+    travelKeywords.some(keyword => 
+      exp.merchant.toLowerCase().includes(keyword) || 
+      (exp.description && exp.description.toLowerCase().includes(keyword))
+    )
+  );
+  
+  if (hasTravelExpenses) {
+    suggestions.push('Travel');
+  }
+  
+  return suggestions;
+};
+
+const useStyles = makeStyles((theme) => ({
+  container: {
+    paddingTop: theme.spacing(4),
+    paddingBottom: theme.spacing(4),
+  },
+  paper: {
+    padding: theme.spacing(3),
+  },
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing(3),
+  },
+  list: {
+    width: '100%',
+    backgroundColor: theme.palette.background.paper,
+  },
+  chip: {
+    marginRight: theme.spacing(1),
+  },
+  categoryForm: {
+    display: 'flex',
+    alignItems: 'center',
+    marginBottom: theme.spacing(2),
+  },
+  categoryInput: {
+    flexGrow: 1,
+    marginRight: theme.spacing(2),
+  },
+  colorSwatch: {
+    width: 20,
+    height: 20,
+    borderRadius: '50%',
+    marginRight: theme.spacing(1),
+    display: 'inline-block',
+  },
+  emptyText: {
+    textAlign: 'center',
+    padding: theme.spacing(3),
+    color: theme.palette.text.secondary,
+  },
+}));
+
+// Color palette for categories
+const categoryColors = [
+  '#4caf50', // Green
+  '#2196f3', // Blue
+  '#ff9800', // Orange
+  '#9c27b0', // Purple
+  '#f44336', // Red
+  '#009688', // Teal
+  '#e91e63', // Pink
+  '#607d8b', // Blue Grey
+];
+
+function CategoryManager() {
+  const classes = useStyles();
+  const { currentUser } = useAuth();
+  const { showSnackbar } = useSnackbar();
+  
+  const [categories, setCategories] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [newCategoryName, setNewCategoryName] = useState('');
+  
+  // Dialog states
+  const [openEditDialog, setOpenEditDialog] = useState(false);
+  const [openDeleteDialog, setOpenDeleteDialog] = useState(false);
+  const [currentCategory, setCurrentCategory] = useState(null);
+  const [editCategoryName, setEditCategoryName] = useState('');
+  
+  // Stats
+  const [categoryCounts, setCategoryCounts] = useState({});
+  
+  // Fetch categories
+  const fetchCategories = async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(`/api/categories?user_id=${currentUser.id}`);
+      setCategories(response.data.categories);
+      
+      // Also fetch category usage stats
+      await fetchCategoryStats();
+      
+      setLoading(false);
+    } catch (error) {
+      console.error('Error fetching categories:', error);
+      showSnackbar('Failed to load categories', 'error');
+      setLoading(false);
+    }
+  };
+  
+  // Fetch category usage stats
+  const fetchCategoryStats = async () => {
+    try {
+      const response = await axios.get(`/api/expenses?user_id=${currentUser.id}`);
+      const expenses = response.data.expenses;
+      
+      // Count expenses per category
+      const counts = {};
+      expenses.forEach((expense) => {
+        const categoryId = expense.category_id || 'uncategorized';
+        counts[categoryId] = (counts[categoryId] || 0) + 1;
+      });
+      
+      setCategoryCounts(counts);
+      
+      // Check for AI category suggestions based on expense patterns
+      const suggestions = suggestCategoryHelper(expenses);
+      if (suggestions.length > 0) {
+        // Check if we already have these categories
+        const existingCategoryNames = categories.map(c => c.name.toLowerCase());
+        const newSuggestions = suggestions.filter(s => 
+          !existingCategoryNames.includes(s.toLowerCase())
+        );
+        
+        if (newSuggestions.length > 0) {
+          showSnackbar(
+            `Based on your expenses, you might want to add these categories: ${newSuggestions.join(', ')}`,
+            'info'
+          );
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching category stats:', error);
+    }
+  };
+  
+  // Initial data load
+  useEffect(() => {
+    if (currentUser) {
+      fetchCategories();
+    }
+  }, [currentUser]);
+  
+  // Add new category
+  const handleAddCategory = async () => {
+    if (!newCategoryName.trim()) {
+      showSnackbar('Please enter a category name', 'error');
+      return;
+    }
+    
+    try {
+      await axios.post('/api/categories', {
+        name: newCategoryName.trim(),
+        user_id: currentUser.id,
+      });
+      
+      showSnackbar('Category added successfully', 'success');
+      setNewCategoryName('');
+      fetchCategories();
+    } catch (error) {
+      console.error('Error adding category:', error);
+      showSnackbar('Failed to add category', 'error');
+    }
+  };
+  
+  // Edit category dialog
+  const handleOpenEditDialog = (category) => {
+    setCurrentCategory(category);
+    setEditCategoryName(category.name);
+    setOpenEditDialog(true);
+  };
+  
+  const handleCloseEditDialog = () => {
+    setOpenEditDialog(false);
+    setCurrentCategory(null);
+    setEditCategoryName('');
+  };
+  
+  const handleUpdateCategory = async () => {
+    if (!editCategoryName.trim()) {
+      showSnackbar('Please enter a category name', 'error');
+      return;
+    }
+    
+    try {
+      await axios.put(`/api/categories/${currentCategory.id}`, {
+        name: editCategoryName.trim(),
+      });
+      
+      showSnackbar('Category updated successfully', 'success');
+      handleCloseEditDialog();
+      fetchCategories();
+    } catch (error) {
+      console.error('Error updating category:', error);
+      showSnackbar('Failed to update category', 'error');
+    }
+  };
+  
+  // Delete category dialog
+  const handleOpenDeleteDialog = (category) => {
+    setCurrentCategory(category);
+    setOpenDeleteDialog(true);
+  };
+  
+  const handleCloseDeleteDialog = () => {
+    setOpenDeleteDialog(false);
+    setCurrentCategory(null);
+  };
+  
+  const handleDeleteCategory = async () => {
+    try {
+      await axios.delete(`/api/categories/${currentCategory.id}`);
+      
+      showSnackbar('Category deleted successfully', 'success');
+      handleCloseDeleteDialog();
+      fetchCategories();
+    } catch (error) {
+      console.error('Error deleting category:', error);
+      showSnackbar('Failed to delete category', 'error');
+    }
+  };
+  
+  // Get a consistent color for a category
+  const getCategoryColor = (index) => {
+    return categoryColors[index % categoryColors.length];
+  };
+  
+  return (
+    <Container maxWidth="md" className={classes.container}>
+      <Paper className={classes.paper}>
+        <div className={classes.header}>
+          <Typography variant="h5" component="h2">
+            Expense Categories
+          </Typography>
+        </div>
+        
+        <div className={classes.categoryForm}>
+          <TextField
+            label="New Category Name"
+            variant="outlined"
+            size="small"
+            value={newCategoryName}
+            onChange={(e) => setNewCategoryName(e.target.value)}
+            className={classes.categoryInput}
+            onKeyPress={(e) => {
+              if (e.key === 'Enter') {
+                handleAddCategory();
+              }
+            }}
+          />
+          <Button
+            variant="contained"
+            color="primary"
+            startIcon={<AddIcon />}
+            onClick={handleAddCategory}
+          >
+            Add
+          </Button>
+        </div>
+        
+        <Divider />
+        
+        {loading ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 20 }}>
+            <CircularProgress />
+          </div>
+        ) : (
+          <List className={classes.list}>
+            {categories.length > 0 ? (
+              categories.map((category, index) => (
+                <React.Fragment key={category.id}>
+                  <ListItem>
+                    <span
+                      className={classes.colorSwatch}
+                      style={{ backgroundColor: getCategoryColor(index) }}
+                    />
+                    <ListItemText
+                      primary={category.name}
+                      secondary={
+                        categoryCounts[category.id] !== undefined ? (
+                          `${categoryCounts[category.id]} expenses`
+                        ) : (
+                          'No expenses'
+                        )
+                      }
+                    />
+                    <ListItemSecondaryAction>
+                      <IconButton
+                        edge="end"
+                        aria-label="edit"
+                        onClick={() => handleOpenEditDialog(category)}
+                      >
+                        <EditIcon />
+                      </IconButton>
+                      <IconButton
+                        edge="end"
+                        aria-label="delete"
+                        onClick={() => handleOpenDeleteDialog(category)}
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </ListItemSecondaryAction>
+                  </ListItem>
+                  {index < categories.length - 1 && <Divider component="li" />}
+                </React.Fragment>
+              ))
+            ) : (
+              <Typography className={classes.emptyText}>
+                No categories found. Add your first category above.
+              </Typography>
+            )}
+          </List>
+        )}
+      </Paper>
+      
+      {/* Category Management Tips */}
+      <Paper className={classes.paper} style={{ marginTop: 24 }}>
+        <Typography variant="h6" gutterBottom>
+          Category Management Tips
+        </Typography>
+        <Typography variant="body2" paragraph>
+          Categories help you organize your expenses and track your spending patterns.
+          Here are some tips for effective categorization:
+        </Typography>
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" gutterBottom>
+              Suggested Categories:
+            </Typography>
+            <div>
+              {[
+                'Food & Dining',
+                'Shopping',
+                'Transportation',
+                'Entertainment',
+                'Bills & Utilities',
+                'Health',
+                'Travel',
+                'Groceries',
+                'Personal Care',
+                'Education',
+              ].map((cat, index) => (
+                <Chip
+                  key={index}
+                  label={cat}
+                  icon={<LabelIcon />}
+                  className={classes.chip}
+                  style={{ margin: 4 }}
+                  variant="outlined"
+                  onClick={() => setNewCategoryName(cat)}
+                />
+              ))}
+            </div>
+          </Grid>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" gutterBottom>
+              Best Practices:
+            </Typography>
+            <Typography variant="body2" component="ul">
+              <li>Use broad categories for general sorting</li>
+              <li>Create specific categories for areas you want to monitor closely</li>
+              <li>Consider seasonal categories (e.g., "Holiday Gifts")</li>
+              <li>Review and refine your categories periodically</li>
+            </Typography>
+          </Grid>
+        </Grid>
+      </Paper>
+      
+      {/* Edit Category Dialog */}
+      <Dialog open={openEditDialog} onClose={handleCloseEditDialog}>
+        <DialogTitle>Edit Category</DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            margin="dense"
+            label="Category Name"
+            type="text"
+            fullWidth
+            value={editCategoryName}
+            onChange={(e) => setEditCategoryName(e.target.value)}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseEditDialog} color="primary">
+            Cancel
+          </Button>
+          <Button onClick={handleUpdateCategory} color="primary" variant="contained">
+            Save
+          </Button>
+        </DialogActions>
+      </Dialog>
+      
+      {/* Delete Category Dialog */}
+      <Dialog open={openDeleteDialog} onClose={handleCloseDeleteDialog}>
+        <DialogTitle>Delete Category</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to delete the category "{currentCategory?.name}"?
+            All expenses in this category will be moved to "Uncategorized".
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDeleteDialog} color="primary">
+            Cancel
+          </Button>
+          <Button onClick={handleDeleteCategory} color="secondary" variant="contained">
+            Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+        

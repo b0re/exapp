@@ -1,0 +1,56 @@
+# FastAPI
+fastapi==0.78.0
+uvicorn==0.17.6
+pydantic==1.9.1
+email-validator==1.2.1
+
+# Authentication
+python-jose==3.3.0
+passlib==1.7.4
+python-multipart==0.0.5
+
+# Database
+sqlalchemy==1.4.37
+alembic==1.8.0
+psycopg2-binary==2.9.3
+
+# Async processing
+redis==4.3.4
+aioredis==2.0.1
+apscheduler==3.9.1
+
+# Google integration
+google-api-python-client==2.51.0
+google-auth-oauthlib==0.5.2
+google-auth==2.8.0
+
+# ML and NLP
+spacy==3.3.1
+transformers==4.20.1
+torch==1.12.0
+prophet==1.1.1
+scikit-learn==1.1.1
+pandas==1.4.3
+numpy==1.23.0
+nltk==3.7
+beautifulsoup4==4.11.1
+
+# WebSockets and real-time
+websockets==10.3
+
+# Utils
+python-dateutil==2.8.2
+pytz==2022.1
+python-dotenv==0.20.0
+httpx==0.23.0
+aiohttp==3.8.1
+jinja2==3.1.2
+markupsafe==2.1.1
+
+# Monitoring and logging
+prometheus-fastapi-instrumentator==5.8.1
+structlog==22.1.0
+python-json-logger==2.0.4
+opentelemetry-api==1.12.0
+opentelemetry-sdk==1.12.0
+opentelemetry-exporter-prometheus==1.12.0
